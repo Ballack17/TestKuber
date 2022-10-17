@@ -1,0 +1,100 @@
+image: openjdk:17.0.1
+
+stages:
+  - build
+  - test
+  - package
+  - deploy
+
+services:
+  - name: docker:dind
+    command: ["--tls=false"]
+
+variables:
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
+  MS_VERSION: "1.0.0"
+
+before_script:
+  - echo `pwd`
+  - echo "$CI_BUILD_NAME, $CI_BUILD_REF_NAME $CI_BUILD_STAGE"
+  - echo "$pitsModuleVersionProduction"
+  - echo "$CI_PIPELINE_IID"
+  - export GRADLE_USER_HOME=`pwd`/.gradle
+
+build-job:
+  stage: build
+  script:
+    - ./gradlew clean bootJar
+  artifacts:
+    paths:
+      - build/libs/*.jar
+
+unit-test:
+  stage: test
+  image:
+    name: openjdk:17.0.1
+  script:
+    - ./gradlew check
+  artifacts:
+    when: always
+    paths:
+      - build/reports/
+      - build/jacoco/test.exec
+    expire_in: 60 days
+    reports:
+      junit: build/test-results/test/**/TEST-*.xml
+
+coverage-test:
+  stage: test
+  image:
+    name: registry.gitlab.com/haynes/jacoco2cobertura:1.0.7
+  script:
+    - python /opt/cover2cover.py build/reports/jacoco/test/jacocoTestReport.xml $CI_PROJECT_DIR/src/main/java/ > build/cobertura.xml
+    - cat build/reports/jacoco/test/html/index.html | grep -o 'Total[^%]*%'
+  needs: [ "unit-test" ]
+  artifacts:
+    reports:
+      cobertura: build/cobertura.xml
+
+docker-job:
+  stage: package
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "develop" || $CI_COMMIT_REF_NAME == "master"
+      when: on_success
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [ "" ]
+  script:
+    - mkdir -p /kaniko/.docker
+    - wget -O jq https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64 && chmod +x ./jq && cp jq /kaniko
+    - wget --header Metadata-Flavor:Google 169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token && cp token /kaniko
+    - echo "{\"auths\":{\"cr.yandex\":{\"auth\":\"$(printf "%s:%s" "iam" "$(cat /kaniko/token | ./jq -r '.access_token')" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/ci/Dockerfile"
+      --destination "${REGISTRY}/${YC_REGISTRY_ID}/${CI_PROJECT_NAME}:${MS_VERSION}.${CI_PIPELINE_IID}"
+    - rm /kaniko/token
+
+deploy-job:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "develop" || $CI_COMMIT_REF_NAME == "master"
+      when: on_success
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [ "" ]
+  script:
+    - echo "Deploying application..."
+    - wget -O jq https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64 && chmod +x ./jq
+    - kubectl config set-cluster erp-dev --certificate-authority=$KUBE_CERT --server=$KUBE_URL --kubeconfig=ci.kubeconfig
+    - kubectl config set-credentials admin-user --token="$KUBE_TOKEN" --kubeconfig=ci.kubeconfig
+    - kubectl config set-context default --cluster=erp-dev --user=admin-user --kubeconfig=ci.kubeconfig
+    - kubectl config use-context default --kubeconfig=ci.kubeconfig
+    - kubectl config view --kubeconfig=ci.kubeconfig
+    - sed -ie "s/image_name/$REGISTRY\\/$YC_REGISTRY_ID\\/$CI_PROJECT_NAME:$MS_VERSION.$CI_PIPELINE_IID/g" ci/k8s-manifest.yaml
+    - kubectl apply -f ci/k8s-manifest.yaml --kubeconfig=ci.kubeconfig
+    - echo "Application successfully deployed."
+
