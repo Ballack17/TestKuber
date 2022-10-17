@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubernetes-test-config
+  namespace: default
+data:
+  application.yaml: |-
+    spring:
+      mail:
+        protocol: smtps
+        host: smtp.yandex.ru
+        port: 465
+        username: *
+        password: *
+        properties:
+          "mail.smtp.ssl.enable": true
+      application:
+        name: kubernetes-test
+      cloud:
+        kubernetes:
+          discovery:
+            all-namespaces: true
+            enabled: true
+            discovery-server-url: *
+
+      liquibase:
+        change-log: classpath:db/changelog/db.changelog-master.yaml
+        default-schema: yandex_master
+
+      jpa:
+        hibernate:
+          use-new-id-generator-mappings: true
+          ddl-auto: validate
+        properties:
+          hibernate.id.new_generator_mappings: true
+          hibernate.globally_quoted_identifiers: true
+          hibernate.jdbc.lob.non_contextual_creation: true
+        database-platform: org.hibernate.dialect.PostgreSQL10Dialect
+        open-in-view: true
+
+      datasource:
+        url: jdbc:postgresql://*.mdb.yandexcloud.net:6432/
+        username: ${DB_USER}
+        password: ${DB_PASSWORD}
+        driver-class-name: org.postgresql.Driver
+        tomcat:
+          max-active: 10
+          test-on-borrow: true
+          max-idle: 10
+        hikari:
+          pool-name: KubernatesDemoPool
+
+    server:
+      shutdown: graceful
+    management:
+      endpoint:
+        health:
+          probes:
+            enabled: true
+      health:
+        livenessState:
+          enabled: true
+        readinessstate:
+          enabled: true
+
+    pits:
+      log:
+        levelErp: INFO
+        levelAll: INFO
+        lokiServer: http://loki:3100/loki/api/v1/push
+
+    forn:
+      kafka:
+        group: kubernatesdemo
+        servers: *
+        user: ${KAFKA_USER}
+        password: ${KAFKA_PASSWORD}
+        truststore:
+          location: *
+          password: ${KAFKA_TRUSTSTORE_PASSWORD}
+
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-test
+  labels:
+    app: kubernetes-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-test
+  template:
+    metadata:
+      labels:
+        app: kubernetes-test
+    spec:
+      containers:
+        - name: kubernetes-test
+          image: image_name
+          env:
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-yndexcloud-sandbox
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-yndexcloud-sandbox
+                  key: password
+            - name: KAFKA_USER
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-user-test
+                  key: username
+            - name: KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-user-test
+                  key: password
+            - name: KAFKA_TRUSTSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-truststore-password
+                  key: password
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: application-config
+              mountPath: "/deployments/config"
+              readOnly: true
+            - name: postgresql-cert
+              mountPath: "/root/.postgresql"
+              readOnly: true
+            - name: kafka-truststore-jks
+              mountPath: "/deployments/ssl/kafka"
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              port: 8080
+              path: /actuator/health/readiness
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              port: 8080
+              path: /actuator/health/liveness
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: [ "sh", "-c", "sleep 10" ]
+      volumes:
+        - name: application-config
+          configMap:
+            name: kubernetes-test-config
+            items:
+              - key: application.yaml
+                path: application.yaml
+        - name: postgresql-cert
+          configMap:
+            name: postgresql-root-ca.crt
+            items:
+              - key: root.crt
+                path: root.crt
+        - name: kafka-truststore-jks
+          secret:
+            secretName: "kafka-truststore-jks"
+            items:
+              - key: keystore.jks
+                path: keystore.jks
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-test
+spec:
+  ports:
+    - port: 80
+      name: plaintext
+      targetPort: 8080
+  selector:
+    app: kubernetes-test
+  type: LoadBalancer
